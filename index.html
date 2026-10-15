@@ -157,7 +157,6 @@
     font-size:11px; color:var(--ink-dim); margin-top:4px; font-family:var(--font-mono);
     display:flex; align-items:center; gap:5px;
   }
-  .chevron{ color: var(--ink-dim); flex-shrink:0; }
 
   .add-btn{
     width:36px; height:36px; border-radius:10px; flex-shrink:0;
@@ -268,10 +267,15 @@
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;
   }
   #pdf-frame{ flex:1; border:none; width:100%; background:#fff; }
-  .viewer-fallback{
+
+  /* ===== OFFLINE NOTICE ===== */
+  .offline-notice{
     flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
     padding:30px; text-align:center; color:var(--ink-dim); gap:14px;
   }
+  .offline-notice svg{ opacity:0.4; }
+  .offline-notice h3{ font-family:var(--font-display); font-style:italic; color:var(--ink); margin:0; }
+  .offline-notice p{ font-size:14px; line-height:1.5; margin:0; }
 
   /* ===== TOAST ===== */
   #toast{
@@ -340,7 +344,7 @@
     <div class="pres-title" id="presTitle"></div>
     <div class="pres-counter" id="presCounter"></div>
   </div>
-  <iframe id="pres-frame"></iframe>
+  <iframe id="pres-frame" allow="autoplay"></iframe>
   <div class="pres-nav">
     <button id="presPrev">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"><path d="m15 18-6-6 6-6"/></svg>
@@ -360,7 +364,7 @@
     </button>
     <div class="viewer-title" id="viewerTitle"></div>
   </div>
-  <div id="viewerBody"></div>
+  <div id="viewerBody" style="flex:1;display:flex;flex-direction:column;"></div>
 </div>
 
 <div id="toast"></div>
@@ -373,6 +377,7 @@ const DB_VERSION = 1;
 const STORE = "canciones";
 
 /* ===================== INDEXEDDB ===================== */
+// Guarda solo metadatos (sin blob): {id, nombre, fechaModificacion, urlPreview}
 let db;
 function openDB(){
   return new Promise((resolve, reject)=>{
@@ -396,14 +401,6 @@ function dbGetAll(){
     req.onerror = ()=> reject(req.error);
   });
 }
-function dbClear(){
-  return new Promise((resolve, reject)=>{
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).clear();
-    tx.oncomplete = resolve;
-    tx.onerror = ()=> reject(tx.error);
-  });
-}
 function dbPut(item){
   return new Promise((resolve, reject)=>{
     const tx = db.transaction(STORE, "readwrite");
@@ -422,10 +419,10 @@ async function dbGetMeta(key){
 }
 
 /* ===================== STATE ===================== */
-let songs = []; // {id, nombre, blob, fechaModificacion}
+let songs = []; // {id, nombre, fechaModificacion, urlPreview}
 let filtered = [];
 let mySet = []; // array de ids en orden
-let activeTab = "buscar"; // "buscar" | "set"
+let activeTab = "buscar";
 
 /* ===================== SET PERSISTENCE ===================== */
 async function loadSet(){
@@ -532,7 +529,7 @@ function renderList(){
         <div class="song-name">${highlightMatch(s.nombre, query)}</div>
         <div class="song-meta">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
-          PDF guardado
+          PDF
         </div>
       </div>
       <button class="add-btn ${inSet ? 'added' : ''}" onclick="event.stopPropagation(); toggleInSet('${s.id}')" aria-label="${inSet ? 'Quitar del set' : 'Agregar al set'}">
@@ -608,7 +605,6 @@ window.clearSet = clearSet;
 
 /* ===================== PRESENTATION MODE ===================== */
 let presIndex = 0;
-let presObjectUrl = null;
 function startPresentation(){
   if(mySet.length === 0) return;
   presIndex = 0;
@@ -623,17 +619,13 @@ function showPresSong(){
 
   document.getElementById("presTitle").textContent = song.nombre;
   document.getElementById("presCounter").textContent = (presIndex+1) + " / " + items.length;
-
-  if(presObjectUrl) URL.revokeObjectURL(presObjectUrl);
-  presObjectUrl = URL.createObjectURL(song.blob);
-  document.getElementById("pres-frame").src = presObjectUrl;
+  document.getElementById("pres-frame").src = song.urlPreview;
 
   document.getElementById("presPrev").disabled = presIndex === 0;
   document.getElementById("presNext").disabled = presIndex === items.length - 1;
 }
 function closePresentation(){
   document.getElementById("presentation").classList.remove("open");
-  if(presObjectUrl){ URL.revokeObjectURL(presObjectUrl); presObjectUrl = null; }
   document.getElementById("pres-frame").src = "";
 }
 document.getElementById("presPrev").addEventListener("click", ()=>{
@@ -646,8 +638,6 @@ document.getElementById("presNext").addEventListener("click", ()=>{
 document.getElementById("presBackBtn").addEventListener("click", ()=> history.back());
 window.startPresentation = startPresentation;
 
-
-
 function applyFilter(){
   const q = document.getElementById("search").value.trim().toLowerCase();
   document.getElementById("clearBtn").classList.toggle("show", q.length > 0);
@@ -656,6 +646,8 @@ function applyFilter(){
 }
 
 /* ===================== SYNC ===================== */
+// Sincronizar solo guarda metadatos (id, nombre, fecha, urlPreview)
+// No descarga PDFs - se abren directo desde Google Drive
 async function syncSongs(){
   const btn = document.getElementById("syncBtn");
   const label = document.getElementById("syncLabel");
@@ -680,19 +672,17 @@ async function syncSongs(){
 
     for(const item of indice){
       const existente = existentesMap[item.id];
-      const necesitaDescarga = !existente || existente.fechaModificacion !== item.fechaModificacion;
+      const esNuevo = !existente;
+      const cambio = existente && existente.fechaModificacion !== item.fechaModificacion;
 
-      if(necesitaDescarga){
-        const pdfRes = await fetch(item.urlDescarga);
-        if(!pdfRes.ok) continue;
-        const blob = await pdfRes.blob();
+      if(esNuevo || cambio){
         await dbPut({
           id: item.id,
           nombre: item.nombre,
           fechaModificacion: item.fechaModificacion,
-          blob: blob
+          urlPreview: item.url  // URL de preview de Google Drive
         });
-        existente ? actualizados++ : nuevos++;
+        esNuevo ? nuevos++ : actualizados++;
       }
     }
 
@@ -745,7 +735,7 @@ function updateStatusLine(){
     text.textContent = `${songs.length} alabanzas · en línea`;
   } else {
     dot.classList.add("offline");
-    text.textContent = `${songs.length} alabanzas · sin conexión (modo offline)`;
+    text.textContent = `${songs.length} alabanzas · sin conexión`;
   }
 }
 
@@ -754,14 +744,13 @@ async function loadFromDB(){
   const all = await dbGetAll();
   songs = all
     .filter(x => !x.id.startsWith("__meta_"))
-    .map(x => ({ id: x.id, nombre: x.nombre, blob: x.blob, fechaModificacion: x.fechaModificacion }))
+    .map(x => ({ id: x.id, nombre: x.nombre, urlPreview: x.urlPreview, fechaModificacion: x.fechaModificacion }))
     .sort((a,b) => a.nombre.localeCompare(b.nombre, 'es'));
   if(activeTab === "buscar") applyFilter(); else renderSetList();
   updateStatusLine();
 }
 
 /* ===================== VIEWER ===================== */
-let currentObjectUrl = null;
 function openSong(id){
   const song = songs.find(s => s.id === id);
   if(!song) return;
@@ -769,17 +758,24 @@ function openSong(id){
   document.getElementById("viewerTitle").textContent = song.nombre;
   const body = document.getElementById("viewerBody");
 
-  if(currentObjectUrl){ URL.revokeObjectURL(currentObjectUrl); }
-  currentObjectUrl = URL.createObjectURL(song.blob);
+  if(navigator.onLine){
+    body.innerHTML = `<iframe id="pdf-frame" src="${song.urlPreview}" style="flex:1;border:none;width:100%;background:#fff;height:100%;"></iframe>`;
+  } else {
+    body.innerHTML = `
+      <div class="offline-notice">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1 1l22 22M16.72 11.06A10.94 10.94 0 0 1 19 12.55M5 12.55a10.94 10.94 0 0 1 5.17-2.39M10.71 5.05A16 16 0 0 1 22.56 9M1.42 9a15.91 15.91 0 0 1 4.7-2.88M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg>
+        <h3>Sin conexión</h3>
+        <p>Necesitas internet para ver los PDFs.<br>Conéctate y vuelve a intentarlo.</p>
+      </div>`;
+  }
 
-  body.innerHTML = `<iframe id="pdf-frame" src="${currentObjectUrl}"></iframe>`;
   document.getElementById("viewer").classList.add("open");
   history.pushState({ viewer: true }, "");
 }
+
 function closeViewer(){
   document.getElementById("viewer").classList.remove("open");
   document.getElementById("viewerBody").innerHTML = "";
-  if(currentObjectUrl){ URL.revokeObjectURL(currentObjectUrl); currentObjectUrl = null; }
 }
 window.addEventListener("popstate", ()=>{
   if(document.getElementById("viewer").classList.contains("open")) closeViewer();
@@ -806,7 +802,6 @@ window.syncSongs = syncSongs;
   await loadFromDB();
   await updateSyncLabel();
 
-  // Si no hay nada guardado y hay internet, sincroniza automático la primera vez
   if(songs.length === 0 && navigator.onLine){
     syncSongs();
   }
